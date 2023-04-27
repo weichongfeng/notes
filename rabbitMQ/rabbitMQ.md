@@ -81,6 +81,156 @@ topic模式，又称主题模式，将路由键和某模式进行匹配。此时
 
 ### Hello World
 
+![](./images/rabbitMQ-6.png)
+
    - [send.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/send.go)
 
    - [receive.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/receive.go)。
+
+### Work Queues
+
+![](images/rabbitMQ-7.png)
+
+   - [send.go](http://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/new_task.go)
+   - [receive.go](http://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/worker.go)
+
+### Publish/Subscribe
+
+![](images/rabbitMQ-8.png)
+
+   - [send.go](http://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/emit_log.go)
+   - [receive.go](http://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/receive_logs.go)
+
+### Routing
+
+![](images/rabbitMQ-9.png)
+
+   - [send.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/emit_log_direct.go)
+   - [receive.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/receive_logs_direct.go)
+
+### Topics
+
+![](images/rabbitMQ-10.png)
+
+   - [send.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/emit_log_topic.go)
+   - [receive.go](https://github.com/rabbitmq/rabbitmq-tutorials/blob/main/go/receive_logs_topic.go)
+
+
+# RabbitMQ高级-过期时间TTL
+
+过期时间TTL表示可以对消息设置预期的时间，在这个时间内都可以被消费者接收获取；过了之后消息将自动被删除。RabbitMQ可以对消息和队列设置TTL。目前有三种种方法可以设置。
+
+   - 通过命令行工具
+
+    rabbitmqctl set_policy TTL ".*"  '{"message-ttl":60000}' --apply-to queues
+
+   - 通过队列属性设置，队列中所有消息都有相同的过期时间。
+
+    args := make(map[string]interface{})
+    args["x-message-ttl"] =  60000
+    channel.queueDeclare( "myqueue" , false , false , false , args)
+
+   - 对消息进行单独设置，每条消息TTL可以不同。
+
+    channel.PublishWithContext(
+		ctx,
+		exchange,
+		//要设置
+		routerKey,
+		true,
+		false,
+		amqp.Publishing{
+                ContentType: "text/plain",
+                Body:        []byte(message),
+                Expiration: "6000",
+		})
+
+	return err
+
+如果上述三种方法同时使用，则消息的过期时间以两者之间TTL较小的那个数值为准。消息在队列的生存时间一旦超过设置的TTL值，就称为dead message被投递到死信队列， 消费者将无法再收到该消息。
+
+# RabbitMQ高级-死信队列
+
+DLX，全称为Dead-Letter-Exchange , 可以称之为死信交换机，也有人称之为死信邮箱。当消息在一个队列中变成死信(dead message)之后，它能被重新发送到另一个交换机中，这个交换机就是DLX ，绑定DLX的队列就称之为死信队列。
+消息变成死信，可能是由于以下的原因：
+
+   - 消息被拒绝
+   - 消息过期
+   - 队列达到最大长度
+
+DLX也是一个正常的交换机，和一般的交换机没有区别，它能在任何的队列上被指定，实际上就是设置某一个队列的属性。当这个队列中存在死信时，Rabbitmq就会自动地将这个消息重新发布到设置的DLX上去，进而被路由到另一个队列，即死信队列。
+要想使用死信队列，只需要在定义队列的时候设置队列参数 x-dead-letter-exchange 指定交换机即可。
+
+#### 注意
+
+   - 如果设置了队列的TTL，那么消息一旦超过了这个时间就会被丢弃（如果有死信队列会被丢弃到死信队列）
+  
+   - 如果设置的是消息的TTL，消息过期了不一定马上被抛弃。因为消息是否过期是在即将投递到消费者之前判定的，当队列出现消息积压的情况时，已过期的消息仍然能在队列中存活。
+
+![](images/rabbitMQ-11.png)
+
+
+# RabbitMQ高级-延迟队列
+
+延迟队列是用来存放需要在指定时间被处理的元素的队列。如果我们希望一条消息在指定时间到了以后或之前处理，可以使用延迟队列。
+
+延迟队列常见的使用场景：订单一段时间内未支付则自动取消、预定会议开始前十分钟通知与会人员参加会议。
+
+TTL是RabbitMQ中一个消息或者队列的属性，表明一条消息或者一个队列中所有消息的最大存活时间。单位是ms
+
+如果一条消息设置了TTL属性，或者一条消息进入了设置TTL属性的队列，则这条消息如果在TTL设置的时间内没有被消费，就会成为“死信”。
+
+如果同时配置了消息的TTL和队列的TTL，较小的值会被使用。
+
+### DLX+TTL实现延迟队列
+
+我们可以使用消息和队列的TTL的属性和死信队列，实现延迟队列。思路是将过期队列转发到死信队列，消费者只要消费死信队列中的消息即可，就实现了延迟队列的功能。
+
+比较队列TTL和消息TTL两种方式:
+
+   - 队列设置TTL属性实现延迟队列，这种方式中，当队列到了过期时间，一定会被放到死信队列。但是这种方式不够灵活，如果想要改变延迟时间，就需要新建队列，面对大量不同时间需求，无法实现。
+
+   - 消息设置TTL属性实现延迟队列，这种方式足够灵活，可以满足任意的延迟时间的需求。但是这种方式的严重缺陷是如果队列中消息积压，会导致过期的消息无法被丢弃（放到死信队列），导致死信队列的消费者无法按时收到消息。
+
+    比如，如果第一个消息的过期时间较长，第二个消息的过期时间较短，
+    则两个消息如果先后发送，会同时被消费者收到。
+    因为RabbitMQ只检查当前第一个消息，直到等到第一个消息到了TTL时间，
+    才会被死信队列收到，然后第二个消息被处理。
+
+    正确的结果应该是根据消息的TTL，第二个消息先到达。
+
+为了解决TTL消息的这种缺陷，我们可以使用插件实现延迟队列，满足不同延迟时间的需求。
+
+### RabbitMQ插件实现延迟队列
+
+#### 安装插件
+
+```rabbitmq_delayed_message_exchange```插件正是为了解决TTL消息无法及时死亡的问题。
+
+在https://www.rabbitmq.com/community-plugins.html 地址下载插件并安装。
+
+下载完以后，将.ez后缀的文件复制到```usr/lib/rabbitmq/lib/rabbitmq_server-3.x.x/plugins```目录，这个目录用于存放RabbitMQ的插件。
+
+进入到这个目录，然后执行语句：
+
+```rabbitmq-plugins enable rabbitmq_delayed_message_exchange```
+
+即可安装插件。
+
+安装成功以后，在web管理界面，添加交换机可以看到新增的```x-delayed-message```类型。
+
+#### 代码实现
+
+如图，使用插件实现延迟队列的原理是创建一个类型为```x-delayed-message```的交换机（延迟交换机），这个类型的交换机支持延迟投递机制，即消息传递到以后先暂存到mnesia表中，到达指定的延迟时间以后才将消息投递出去。
+
+如图，使用插件实现延迟队列的原理是创建一个类型为```x-delayed-message```的交换机（延迟交换机），这个类型的交换机支持延迟投递机制，即消息传递到以后先暂存到mnesia表中，到达指定的延迟时间以后才将消息投递出去。
+
+![](images/rabbitMQ-12.png)
+
+
+
+
+
+# RabbitMQ高级-集群
+
+假设有三个个rabbitmq节点，分别为rabbit-1、 rabbit-2、rabbit-3，rabbit-1作为主节点，rabbit-2、rabbit-3作为从节点。
