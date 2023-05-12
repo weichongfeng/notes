@@ -219,13 +219,118 @@ TTL是RabbitMQ中一个消息或者队列的属性，表明一条消息或者一
 
 安装成功以后，在web管理界面，添加交换机可以看到新增的```x-delayed-message```类型。
 
-#### 代码实现
+#### 实现原理
 
 如图，使用插件实现延迟队列的原理是创建一个类型为```x-delayed-message```的交换机（延迟交换机），这个类型的交换机支持延迟投递机制，即消息传递到以后先暂存到mnesia表中，到达指定的延迟时间以后才将消息投递出去。
 
 如图，使用插件实现延迟队列的原理是创建一个类型为```x-delayed-message```的交换机（延迟交换机），这个类型的交换机支持延迟投递机制，即消息传递到以后先暂存到mnesia表中，到达指定的延迟时间以后才将消息投递出去。
 
 ![](images/rabbitMQ-12.png)
+
+
+# RabbitMQ高级-发布确认
+
+发布确认用于确保消息的可靠投递，如果消息投递成功，返回确认信息，如果投递失败，返回失败信息并确保消息不会丢失。
+
+#### 发布确认
+
+发布确认的回调方法可以判断出交换机是否收到消息，当交换机宕机或其他原因导致交换机没有收到生产者发出的消息时，回调方法能够做出反馈。
+
+##### 单个确认发布
+单个确认发布，即对每一条消息进行同步确认，生产者发布一条消息后只有它被确认发布后，后续的消息才能继续发布。
+
+##### 批量确认发布
+批量确认发布是指根据批次大小确认发布，这种方式的缺点是当发生故障导致发布出现问题时，不知道哪个消息出问题。
+
+##### 异步确认发布
+异步确认发布是效率和可靠性最高的。对于已确认消息和未确认消息，异步确认方式都能够处理。
+
+异步确认发布主要是通过addConfirmListener方法监听确认和未确认的消息，使用哈希表记录所有发布的消息，对于成功确认的消息从哈希表中删除，剩下的是未确认的消息。
+
+创建信道，配置异步通道
+
+   ```
+   ch, err := conn.Channel()
+
+	if err != nil {
+		return err
+	}
+
+	// 异步确认消息
+	err = ch.Confirm(false)
+
+	if err != nil {
+		return err
+	}
+
+	confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+   ```
+
+生产者代码
+
+   生产者代码可以指定消息id，即回调接口中消息的id。
+
+   ```
+   //2.发送消息
+   err = c.Ch.PublishWithContext(
+      ctx,
+      exchange,
+      //要设置
+      routerKey,
+      true,
+      false,
+      amqp.Publishing{
+         ContentType: "text/plain",
+         Body:        []byte(message),
+      })
+
+   return err
+   ```
+
+实现回调接口
+
+   ```
+   func (c *Connection) NotifyAck(confirms chan amqp.Confirmation) {
+
+      for ack := range confirms {
+         if ack.Ack {
+            fmt.Printf("confirmed delivery with delivery tag: %d", ack.DeliveryTag)
+         } else {
+            fmt.Printf("confirmed delivery of delivery tag: %d", ack.DeliveryTag)
+         }
+      }
+   }
+   ```
+**如果只开启发布确认模式的话，当交换机收到生产者发送的消息后，会发布确认消息给生产者，如果发现路由不通，则会直接丢弃消息，此时生产者处于不知情状态，就会造成消息丢失。**
+
+#### 回退消息
+
+回退消息用在消息无法被路由（队列宕机）的情况。
+
+   ```
+   returnChan := c.Ch.NotifyReturn(make(chan amqp.Return, 1))
+
+	go func() {
+		for ack := range returnChan {
+			g.Log().Info(ctx, fmt.Sprintf("消息消息被回退:消息id:%:%s", ack.MessageId, string(ack.Body)))
+		}
+	}()
+   ```
+
+生产者和消费者的实现并无特殊。当发送的消息无法被路由（比如队列宕机、RoutingKey错误等）时，会调用回退方法。
+
+通过发布确认机制，生产者可以得知消息是否被交换机接收；通过回退消息机制，生产者可以得知消息消息是否被分发到队列中。
+
+### 备份交换机
+
+通过回退消息，我们可以感知到无法被路由的消息，但是只能把消息回退，如果像处理非常复杂。想要处理无法被路由的消息，需要使用备份交换机。
+
+备份交换机可以理解为RabbitMQ中交换机的备胎，当交换机收到一条不可路由消息时，将会把这条消息转发到备份交换机中。通常备份交换机的类型为Fanout，这样就能将不可路由消息广播到所有和它绑定的队列中。
+
+备份交换机除了添加备份队列以外，还可以添加一个报警队列，这样如果有无法被路由的消息，报警队列的消费者可以发出警报信息进行提示。
+
+![](./images/rabbitMQ-13.png)
+
 
 
 
