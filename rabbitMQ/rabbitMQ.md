@@ -332,10 +332,275 @@ TTL是RabbitMQ中一个消息或者队列的属性，表明一条消息或者一
 ![](./images/rabbitMQ-13.png)
 
 
+声明交换机时，设置备份交换机属性
+```
+   //声明交换机，设置备份交换机
+   if err := ch.ExchangeDeclare("history", "direct", true, false, false, true, map[string]interface{}{
+      "alternate-exchange": "backup_exchange",
+   }); err != nil {
+      return err
+   }
+```
 
+声明备份交换机和队列并绑定
+
+```
+   //声明备份交换机
+   if err := ch.ExchangeDeclare("backup_exchange", "fanout", true, false, false, true, nil); err != nil {
+      return err
+   }
+   //声明备份交换机的队列
+   if _, err := ch.QueueDeclare("backup_quque", true, false, false, true, nil); err != nil {
+      return err
+   }
+   //绑定备份交换机的备份队列
+   if err := ch.QueueBind("backup_quque", "", "backup_exchange", true, nil); err != nil {
+      return err
+   }
+```
+
+如果**消息回退**机制和**备份交换机**同时配置，则备份交换机机制优先。因为备份队列收到了消息，理解为消息成功路由。
 
 
 
 # RabbitMQ高级-集群
 
+#### 集群搭建
+
 假设有三个个rabbitmq节点，分别为rabbit-1、 rabbit-2、rabbit-3，rabbit-1作为主节点，rabbit-2、rabbit-3作为从节点。
+
+1、修改3台机器的主机名称
+
+将3台机器的主机名分别修改为rabbit-1、rabbit-2、rabbit-3，方便识别。
+
+```
+# 在/etc/hostname文件中修改
+vim /etc/hostname
+```
+2、配置各个节点的hosts文件
+
+配置**hosts**文件，确保各个节点能够互相认识对方。
+```
+vim /etc/hosts
+```
+在每台主机的/etc/hosts文件中添加三个节点的ip地址和主机名，比如：
+```
+123.123.123.1 rabbit-1
+123.123.123.2 rabbit-2
+123.123.123.3 rabbit-3
+```
+3、确保各个节点的cookie文件相同
+
+在其中一个节点上，比如node1节点上，执行远程复制命令，将本机的cookie文件远程复制到另外两个节点中：
+```
+scp /var/lib/rabbitmq/.erlang.coolie root@node2:/var/lib/rabbitmq/.erlang.cookie
+scp /var/lib/rabbitmq/.erlang.coolie root@node3:/var/lib/rabbitmq/.erlang.cookie
+```
+4、启动RabbitMQ服务
+
+在每台机器上启动RabbitMQ服务：
+```
+# detached代表以后台守护进程方式启动
+rabbitmq-server start -detached
+```
+5、将节点加入集群
+
+在node2中执行下列指令，将node2加入到node1的集群：
+```
+# stop_app表示之关闭RabbitMQ服务，stop则会将Erlang虚拟机也关闭
+rabbitmqctl stop_app
+rabbitmqctl reset
+rabbitmqctl join_cluster rabbit@rabbit-1
+rabbitmqctl start_app
+```
+同理，将node3加入到node2的集群。
+
+6、查看集群状态
+```
+rabbitmqctl cluster_status
+```
+7、需要重新设置用户
+```
+# 添加用户，用户名admin，密码123
+rabbitmqctl add_user admin 123
+# 设置用户角色
+rabbitmqctl set_user_tags admin administrator
+# 设置用户权限
+rabbitmqctl set_permissions -p "/" admin ".*" ".*" ".*"
+```
+至此，包括三个节点的集群搭建完成。
+
+如果想要解除集群节点，需要在节点中执行解除指令，比如 在节点1中解除节点2，需要在节点1中执行下面的指令：
+```
+# node1解除node2节点
+rabbitmqctl forget_cluster_node rabbit@rabbit-2
+```
+
+#### 镜像队列
+
+镜像队列是指将队列镜像到集群中的其他Broker节点之上，这样当集群中某一节点失效后，队列能够自动切换到镜像中的另一个节点上保证服务的可用性。
+
+和集群保证的可用性不同的是，**集群中某一节点宕机后，其中的队列都不可用了，队列中的消息也无法被消费。而镜像队列能够保证集群中的节点宕机后，队列中的消息也不会丢失。**
+
+搭建步骤
+
+以3个集群节点为例，通过web管理页面创建镜像队列。
+
+1、启动三个集群节点
+
+2、登录网页管理，选择policy
+
+![](./images/rabbitMQ-14.png)
+
+3、添加policy
+
+![](./images/rabbitMQ-15.png)
+
+这样，在其中一个节点上创建一个队列，则其他两个节点都有这个队列的镜像队列。当节点宕机以后，可以继续使用其他节点中的队列，保证了高可用性。
+
+#### 高可用负载均衡
+
+1、使用Haproxy实现负载均衡。
+
+Nginx、lvs、Haproxy之间的区别：http://www.ha97.com/5646.html
+
+假设当前有一个Haproxy服务器，要负责一个3个节点的RabbitMQ集群的负载均衡，需要在Haproxy服务器配置如下：
+
+安装Haproxy：
+
+```
+yum -y install haproxy
+```
+
+修改**haproxy.cfg**：
+```
+vim /etc/haproxy/haproxy.cfg
+```
+修改以下内容，将IP改为集群中节点的IP地址：
+```
+# 检测心跳频率
+server rabbitmq_node1 123.123.123.1:5672 check inter 5000 rise 2 fall 3 weight1
+server rabbitmq_node1 123.123.123.2:5672 check inter 5000 rise 2 fall 3 weight1
+server rabbitmq_node1 123.123.123.3:5672 check inter 5000 rise 2 fall 3 weight1
+```
+启动Haproxy：
+```
+haproxy -f /etc/haproxy/haproxy.cfg
+# 查看服务是否启动
+ps -ef | grep haproxy
+```
+
+访问地址： http://haproxy主机地址:8888/stats
+
+2、Keeplived实现双机热备份
+
+上面只使用了一个Haproxy主机进行负载均衡，如果Haproxy主机宕机，虽然RabbitMQ集群没有故障，但是对于外界客户端来说所有的连接都会断开。为了确保负载均衡服务的可靠性，使用Keepalied做高可用，实现故障转移。
+
+Keepalived能够通过自身健康检查，资源接管功能做双机热备份。
+
+Keepalived实现双机热备的步骤可参考：https://blog.51cto.com/hellocjq/2089450
+
+#### Federation Plugin
+
+Federation插件的目的是在不同集群的Broker之间同步消息。
+
+Federation plugin可以实现Federation Exchange和Federation Queue两种功能。
+
+##### ederation Exchange
+
+比如，位于两个地区（不同集群）的两个交换机，如果需要两个地区的用户访问两个节点速度一致，不会出现A地区用户访问B地区服务器延迟比较高的情况，需要使用
+Federation exchange。
+
+将其中一个设置为上游交换机，另一个设置为下游交换机，这样发送到上游交换机的信息会通过federation机制同步到下游交换机。这样下游交换机的消费者访问两个交换机的速度是一致的。
+
+![](images/rabbitMQ-16.png)
+
+搭建步骤参考：https://www.cnblogs.com/yeyongjian/p/13964161.html
+
+##### Federation Queue
+
+联邦队列可以在多个Broker节点或集群之间，为单个队列提供负载均衡的功能。一个联邦队列可以连接一个或多个上游队列，并从这些上游队列中获取消息以满足本地消费者消费消息的需求。
+
+![](images/rabbitMQ-17.png)
+
+####  Shovel Plugin
+
+Shovel plugin能够可靠、持续地从一个Broker中的队列（源，source）拉去数据并转发到另一个Broker中的交换器中（目的端，destination）。
+
+源端的队列和目的端的交换机可以同时位于同一个Broker，也可以位于不同的Broker上。
+
+部署方法可以参考官方文档：https://www.rabbitmq.com/shovel.html
+
+# RabbitMQ其他知识点
+
+####幂等性
+
+幂等性(idempotence)指的是用户对同一操作发起的一次请求或多次请求的结果是一致的，不会因为多次点击而产生了副作用。消息重复消费时需要考虑消息的幂等性。
+
+消息重复消费：如果MQ已经把消息发送给了消费者，消费者在返回ack时网络中断，MQ未收到确认消息，会将消息重新发送给其他的消费者，或者再次发送给该消费者，就会造成消息重复消费。
+
+解决方式：
+
+   - 对于消费端，可以使用全局ID或者唯一标识比如时间戳等唯一的id，每次消费时用该id判断该消息是否已消费过。
+   - 对于发送端，有两种方式：①唯一ID+指纹码机制（基于业务规则拼接的唯一字符串），查询数据库判断是否重复；②利用redis的原子性，setnx指令天然具有幂等性。
+  
+#### 优先队列
+
+优先队列可以根据消息的优先级进行消息的分发，优先队列会将队列中的消息按照优先级进行排序，按照优先级从高到低的顺序进行消息的发送，而不考虑消息进入队列的顺序。因此，使用优先级队列需要确保所有消息都发送到队列中以后，消费者才开始消费，确保这些消息能够在队列中排序。
+
+使用优先队列需要满足两个条件：①队列是优先队列；②消息需要设置优先级。
+
+声明优先队列：
+
+```
+var params = map[string]interface{}{
+   "x-max-priority": 10, //设置队列为优先级队列，且消息的最大优
+}
+channel.queueDeclare("Q1",true,false,false,params);
+```
+设置消息的优先级：
+
+```
+// 在生产者代码中，设置消息的优先级为5
+err := channel.PublishWithContext(
+		ctx,
+		"ExchangeName",
+		"RouterKey",
+		true,
+		false,
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        []byte(message),
+         Priority: 5
+		})
+```
+当不同优先级的消息都进入优先队列以后，优先队列将消息进行排序，然后消费者进行消费，接收到的消息是按照优先级从高到低排列。
+
+#### 惰性队列
+RabbitMQ 3.6.0版本引入了惰性队列的概念。惰性队列会尽可能的将消息存入磁盘中，消费者消费到对应的消息时，才会被加载到内存中。
+
+惰性队列的目的是为了能够支持更长的队列，当消费者下线或者宕机等情况导致长时间不能消费消息造成堆积时，惰性队列就发挥作用了。
+
+开启惰性队列：
+
+```
+var params = map[string]interface{}{
+   "x-queue-mode": "lazy", //设置队列为惰性队列
+}
+channel.queueDeclare("Q1",false,false,false,params);
+```
+**x-queue-mode**表示队列的模式，默认为**default**模式，如果想要声明惰性队列，则将其设置为**lazy**模式即可。
+
+在面对大量消息积压的情况下，惰性队列能够占用更少的内存，从而存储更多的消息。
+
+
+# RabbitMQ消息可靠性流程及注意事项
+
+![](images/rabbitMQ-18.png)
+
+注意事项：
+ 
+   - 消息先入库成功，再向RabbitMQ发送消息，如果消息投递失败，日志记录并报警，可以用定时任务重新投递消息
+   - 定时任务重发，如果超过规定重发次数，将消息状态改为投递失败，则需要人工干预，进行补偿。
+   - 如果交换机未能路由到队列，消息回进入到备份交换机，备份队列的消费者，将消息状态重置为失败。
+   - 消费者消费消息，成功记录消息并返回ack，失败直接nack（false）消息进入失信队列，死信队列消费者判断消费次数，如果大于规定次数，人工干预，进行补偿。
